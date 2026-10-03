@@ -29,14 +29,18 @@
 # NOTE: Gemma-2-9B requires accepting Google's license on HuggingFace
 #       before downloading: https://huggingface.co/google/gemma-2-9b
 # =================================================================
-set -e
+
+# NOTE: deliberately NOT using `set -e`.  A single (model, mode) that fails
+# must not abort the whole pipeline: the later analysis / plot / layer-stacking
+# stages still have work to do on the runs that succeeded.  Every stage skips
+# what already exists, so re-running after a failure is safe and cheap.
 
 export VLLM_USE_FLASHINFER_SAMPLER=0
 export VLLM_WSL2_ENABLE_PIN_MEMORY=1
 export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 
 OUT="/mnt/f"
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 
 echo "============================================================"
 echo "Stage 1: Layer sweep (position/context invariance, quick)"

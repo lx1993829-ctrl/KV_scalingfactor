@@ -79,6 +79,39 @@ def nn_path(mk, mode, feat):
     return profile_path(mk, mode).replace(".npz", f"_nn_{feat}.npz")
 
 
+def profile_ok(path):
+    """
+    A profile counts as present only if it actually captured usable tokens.
+
+    An all-ambiguous run (e.g. the Gemma/int4 eviction-aliasing failure) still
+    writes an npz, so a bare os.path.exists would skip it forever on re-run and
+    never pick up the fix.  Here we load the tiny status array and require that
+    at least half the captured tokens are clean (status==1); otherwise the file
+    is treated as missing and re-profiled.  Wherever OUT points, no path needs
+    to be deleted by hand.
+
+    We only force a redo when we can POSITIVELY prove the file is bad.  A file
+    that exists but lacks a status array (older format) or cannot be read here
+    is assumed present, so a false negative never triggers a 90-minute reprofile
+    of a good profile.
+    """
+    if not os.path.exists(path):
+        return False
+    try:
+        import numpy as np
+        d = np.load(path)
+        if "status" not in d.files:
+            return True          # older format, no status array -> assume valid
+        status = d["status"]
+    except Exception:
+        return True              # exists but unreadable here -> don't redo blindly
+    captured = int((status != 0).sum())
+    clean = int((status == 1).sum())
+    if captured == 0:
+        return False
+    return clean >= 0.5 * captured
+
+
 def run(cmd, dry):
     print("  $ " + " ".join(cmd))
     if dry:
@@ -115,10 +148,41 @@ def main():
 
     # ---- stage 1: profile -------------------------------------------------
     if args.stage in ("all", "profile"):
-        todo = [(mk, md) for mk in mks for md in mds
-                if args.force or not os.path.exists(profile_path(mk, md))]
+        # Decide what to (re)profile.  A profile is redone when it is missing,
+        # when --force is given, or when it exists but is INVALID (an all-
+        # ambiguous run such as the Gemma/int4 failure still writes an npz).
+        # For an invalid profile we announce it and remove both the bad npz and
+        # any stale checkpoint, so the redo is a clean overwrite and the log
+        # shows exactly what happened -- nobody has to hunt for a path to delete.
+        todo = []
+        for mk in mks:
+            for md in mds:
+                p = profile_path(mk, md)
+                if args.force:
+                    todo.append((mk, md))
+                    continue
+                if profile_ok(p):
+                    continue
+                if os.path.exists(p):
+                    try:
+                        import numpy as np
+                        st = np.load(p)["status"]
+                        print(f"  INVALID profile {mk}/{md}: clean "
+                              f"{int((st==1).sum())}/{int((st!=0).sum())} "
+                              f"-> re-profiling (will overwrite)")
+                    except Exception:
+                        print(f"  INVALID profile {mk}/{md}: unreadable "
+                              f"-> re-profiling (will overwrite)")
+                    if not dry:
+                        for stale in (p, p.replace(".npz", "_ckpt.npz")):
+                            try:
+                                os.remove(stale)
+                                print(f"    removed stale {stale}")
+                            except OSError:
+                                pass
+                todo.append((mk, md))
         print(f"\n=== stage 1: profile, {len(todo)} runs "
-              f"({len(mks)*len(mds) - len(todo)} already present) ===")
+              f"({len(mks)*len(mds) - len(todo)} already valid) ===")
         for mk, md in todo:
             hf, _ = MODELS[mk]
             path = f"{OUT}/kvmeta_{mk}_{md}.npz"

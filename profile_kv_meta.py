@@ -110,7 +110,21 @@ def rpc_probe(worker, layer):
 def rpc_step(worker, layer):
     """
     Diff the metadata caches against the snapshot held on the worker, return
-    only the slots written since the last call, then re-baseline.
+    the slot written for the current request, then re-baseline.
+
+    Between two consecutive single-token requests TWO kinds of slot can differ:
+    the slot freshly written for the new token, and the slot of the PREVIOUS
+    request being evicted back to the 1.0 sentinel (max_num_seqs=1, no prefix
+    caching).  A naive "count every changed slot" sees both and brands every
+    token ambiguous, and worse, changed[0] may land on the evicted slot, so the
+    recorded scale is the wrong token's.  This is exactly the Gemma/int4 failure
+    mode: the int4 packed word makes the eviction register as a change where the
+    symmetric modes' reset-to-1.0 did not.
+
+    Fix: among changed slots keep only those whose NEW value is still
+    non-sentinel.  An eviction returns to 1.0 in every head and drops out, so
+    what remains is the genuine write(s).  n_changed counts those; n_raw keeps
+    the unfiltered count so the host can see the eviction traffic.
 
     Nothing is ever written into cache memory: the caches are strided views
     aliasing live K/V bytes, and writing into them while kernels are in flight
@@ -130,12 +144,17 @@ def rpc_step(worker, layer):
         return {"n_changed": -1}
 
     k_prev, v_prev = prev
-    changed = ((k_now != k_prev) | (v_now != v_prev)).any(dim=-1).nonzero()
-    n = int(changed.shape[0])
+    changed_slot = ((k_now != k_prev) | (v_now != v_prev)).any(dim=-1)
+    n_raw = int(changed_slot.sum())
 
-    res = {"n_changed": n, "k": None, "v": None, "slot": None}
+    # a genuine write leaves the slot non-sentinel; an eviction resets to 1.0
+    active = (k_now != 1.0).any(dim=-1) | (v_now != 1.0).any(dim=-1)
+    sel = (changed_slot & active).nonzero()
+    n = int(sel.shape[0])
+
+    res = {"n_changed": n, "n_raw": n_raw, "k": None, "v": None, "slot": None}
     if n >= 1:
-        b, s = changed[0].tolist()
+        b, s = sel[0].tolist()
         res["slot"] = [b, s]
         res["k"] = k_now[b, s].tolist()
         res["v"] = v_now[b, s].tolist()
@@ -324,9 +343,9 @@ def main():
                     k_zp[tid], v_zp[tid] = kz, vz
                 status[tid] = 1 if n == 1 else 2
                 if n > 1 and len(bad) < 20:
-                    bad.append((tid, f"n_changed={n}"))
+                    bad.append((tid, f"n_changed={n} (raw={r.get('n_raw','?')})"))
             elif len(bad) < 20:
-                bad.append((tid, "no write detected"))
+                bad.append((tid, f"no active write (raw={r.get('n_raw','?')})"))
         except Exception as e:
             if len(bad) < 20:
                 bad.append((tid, repr(e)[:120]))
@@ -356,8 +375,11 @@ def main():
           f"K {int((k_scale==FLOOR).sum())}  V {int((v_scale==FLOOR).sum())}")
     if mode in ASYMMETRIC:
         ok = status == 1
-        print(f"  zp range: K [{k_zp[ok].min():.0f}, {k_zp[ok].max():.0f}]  "
-              f"V [{v_zp[ok].min():.0f}, {v_zp[ok].max():.0f}]")
+        if ok.any():
+            print(f"  zp range: K [{k_zp[ok].min():.0f}, {k_zp[ok].max():.0f}]  "
+                  f"V [{v_zp[ok].min():.0f}, {v_zp[ok].max():.0f}]")
+        else:
+            print("  zp range: n/a (no clean tokens captured)")
     if bad:
         print("first failures:")
         for tid, why in bad:
