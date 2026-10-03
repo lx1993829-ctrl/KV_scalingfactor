@@ -1,8 +1,3 @@
-export VLLM_USE_FLASHINFER_SAMPLER=0 
-
-export VLLM_WSL2_ENABLE_PIN_MEMORY=1
-
-export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 
 bash smoke_gemma_int4.sh    # 先几分钟验证
 
